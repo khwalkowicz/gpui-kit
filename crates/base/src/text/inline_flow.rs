@@ -276,9 +276,16 @@ pub(super) struct FlowPaintItem {
 impl InlineFlow {
     pub(super) fn new(
         id: impl Into<ElementId>,
-        items: Vec<InlineFlowItem>,
+        mut items: Vec<InlineFlowItem>,
         link_click_handler: Option<Arc<LinkClickHandlerFn>>,
     ) -> Self {
+        for item in &mut items {
+            if let InlineFlowItem::Text { links, .. } = item {
+                for (range, link) in links {
+                    link.occurrence.get_or_insert_with(|| range.clone());
+                }
+            }
+        }
         Self {
             id: id.into(),
             items,
@@ -1816,6 +1823,32 @@ pub(super) fn slice_ranges<T, U>(
 mod tests {
     use super::*;
     use gpui::SharedUri;
+
+    #[test]
+    fn fallback_link_occurrences_survive_fragment_slicing() {
+        let flow = InlineFlow::new(
+            "links",
+            vec![InlineFlowItem::Text {
+                state: Arc::default(),
+                text: "same next".into(),
+                links: vec![(0..4, LinkMark::default()), (5..9, LinkMark::default())],
+                highlights: Vec::new(),
+                backgrounds: Vec::new(),
+                reveal: None,
+            }],
+            None,
+        );
+        let InlineFlowItem::Text { links, .. } = &flow.items[0] else {
+            panic!("text item");
+        };
+        let first = slice_ranges(links, 0, 4, |range, link| (range, link.clone()));
+        let second = slice_ranges(links, 5, 9, |range, link| (range, link.clone()));
+        assert_eq!(first[0].0, second[0].0);
+        assert_eq!(first[0].1.occurrence, Some(0..4));
+        assert_eq!(second[0].1.occurrence, Some(5..9));
+        let continuation = slice_ranges(links, 2, 4, |range, link| (range, link.clone()));
+        assert_eq!(continuation[0].1.occurrence, first[0].1.occurrence);
+    }
 
     mod frames {
         use super::super::FLOW_LAYOUTS;

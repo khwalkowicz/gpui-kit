@@ -120,3 +120,38 @@ impl LinkInteraction {
         self.gesture.down(target, event.clone()) || was_pressed
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presentation_prioritizes_pressed_hover_and_visited_without_changing_metrics() {
+        let style = |color| HighlightStyle {
+            color: Some(gpui::rgb(color).into()),
+            font_weight: Some(gpui::FontWeight::BOLD),
+            font_style: Some(gpui::FontStyle::Italic),
+            ..Default::default()
+        };
+        let presentation = LinkPresentation {
+            normal: style(0x111111),
+            hover: style(0x222222),
+            pressed: style(0x333333),
+            visited: style(0x444444),
+            revision: 0,
+            is_visited: Arc::new(|url| url == "visited"),
+        };
+        for (hover, pressed, url, expected) in [
+            (false, false, "new", presentation.normal),
+            (false, false, "visited", presentation.visited),
+            (true, false, "visited", presentation.hover),
+            (true, true, "visited", presentation.pressed),
+            (false, true, "new", presentation.pressed),
+        ] {
+            let appearance = presentation.appearance(hover, pressed, url);
+            assert_eq!(appearance.color, expected.color);
+            assert_eq!(appearance.font_weight, None);
+            assert_eq!(appearance.font_style, None);
+        }
+    }
+}
