@@ -1387,11 +1387,124 @@ fn parse_content(
             format!("{}{}", content.document.source, options.pending_text).into();
         Arc::make_mut(&mut content.document.blocks)
             .extend(Arc::unwrap_or_clone(new_document.blocks));
+        content.node_cx.link_refs.extend(node_cx.link_refs);
     } else {
         content.document = new_document;
+        content.node_cx.link_refs = node_cx.link_refs;
     }
 
     Ok(content)
+}
+
+#[cfg(test)]
+mod reference_retention {
+    use super::*;
+
+    fn parse_update(content: ParsedContent, source: &str, append: bool) -> ParsedContent {
+        parse_content(
+            TextViewFormat::Markdown,
+            content,
+            &UpdateOptions {
+                revision: 1,
+                pending_text: source.to_owned(),
+                append,
+                mode: if append {
+                    ParseMode::Compatible
+                } else {
+                    ParseMode::Replace
+                },
+                markdown_extensions: Arc::default(),
+            },
+        )
+        .expect("reference parse")
+    }
+
+    #[test]
+    fn full_parse_retains_reference_definitions_for_rendering() {
+        let source = "[reference][target]\n\n[target]: https://example.invalid/reference \"Reference title\"\n";
+        let content = parse_update(ParsedContent::default(), source, false);
+        let reference = &content.node_cx.link_refs[&SharedString::from("target")];
+
+        assert_eq!(reference.url.as_ref(), "https://example.invalid/reference");
+        assert_eq!(reference.title.as_deref(), Some("Reference title"));
+        assert_eq!(content.document.source.as_ref(), source);
+        assert_eq!(content.node_cx.offset, 0);
+    }
+
+    #[test]
+    fn append_retains_earlier_definitions_and_merges_new_ones() {
+        let source = "[target]: https://example.invalid/reference\n\n[reference][target]\n\nTail";
+        let initial = parse_update(ParsedContent::default(), source, false);
+        let chunk = "\n\n[next]: https://example.invalid/next";
+        let appended = parse_update(initial, chunk, true);
+
+        assert_eq!(appended.node_cx.link_refs.len(), 2);
+        assert_eq!(
+            appended.node_cx.link_refs[&SharedString::from("target")]
+                .url
+                .as_ref(),
+            "https://example.invalid/reference"
+        );
+        assert_eq!(
+            appended.node_cx.link_refs[&SharedString::from("next")]
+                .url
+                .as_ref(),
+            "https://example.invalid/next"
+        );
+        assert_eq!(
+            appended.document.source.as_ref(),
+            format!("{source}{chunk}")
+        );
+        assert_eq!(appended.node_cx.offset, 0);
+
+        let continued = parse_update(appended, "-continued", true);
+        assert_eq!(continued.node_cx.link_refs.len(), 2);
+        assert_eq!(
+            continued.node_cx.link_refs[&SharedString::from("next")]
+                .url
+                .as_ref(),
+            "https://example.invalid/next-continued"
+        );
+        assert_eq!(
+            continued.node_cx.link_refs[&SharedString::from("target")]
+                .url
+                .as_ref(),
+            "https://example.invalid/reference"
+        );
+        assert_eq!(continued.node_cx.offset, 0);
+    }
+
+    #[test]
+    fn replacement_drops_obsolete_definitions_and_updates_reused_identifiers() {
+        let initial = parse_update(
+            ParsedContent::default(),
+            "[target]: https://example.invalid/old\n\n[obsolete]: https://example.invalid/obsolete",
+            false,
+        );
+        let replacement = parse_update(
+            initial,
+            "[reference][target]\n\n[target]: https://example.invalid/replacement",
+            false,
+        );
+
+        assert_eq!(replacement.node_cx.link_refs.len(), 1);
+        assert_eq!(
+            replacement.node_cx.link_refs[&SharedString::from("target")]
+                .url
+                .as_ref(),
+            "https://example.invalid/replacement"
+        );
+        assert!(
+            !replacement
+                .node_cx
+                .link_refs
+                .contains_key(&SharedString::from("obsolete"))
+        );
+
+        let empty = parse_update(replacement, "", false);
+        assert!(empty.node_cx.link_refs.is_empty());
+        assert!(empty.document.source.is_empty());
+    }
 }
 
 #[cfg(test)]
