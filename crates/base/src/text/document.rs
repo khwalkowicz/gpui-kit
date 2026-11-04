@@ -9,7 +9,9 @@ use std::{
 
 use crate::text::{
     SelectionFormat,
+    block_list_layout::BlockListLayout,
     node::{BlockNode, NodeContext, SelectionStyles, SourceRangeSelection},
+    state::LeadingElement,
 };
 
 /// The parsed document AST.
@@ -240,6 +242,7 @@ impl ParsedDocument {
     pub(super) fn render_root(
         &self,
         list_state: Option<ListState>,
+        leading: Option<LeadingElement>,
         node_cx: &NodeContext,
         window: &mut Window,
         cx: &mut App,
@@ -270,15 +273,19 @@ impl ParsedDocument {
         };
 
         let blocks = &self.blocks;
-        if list_state.item_count() != blocks.len() {
-            list_state.reset(blocks.len());
+        let layout = BlockListLayout::new(leading.is_some());
+        if list_state.item_count() != layout.item_count(blocks.len()) {
+            list_state.reset(layout.item_count(blocks.len()));
         }
 
         div().size_full().child(
             gpui::list(list_state, {
                 let node_cx = node_cx.clone();
                 let blocks = blocks.clone();
-                move |ix, window, cx| {
+                move |item_ix, window, cx| {
+                    let Some(ix) = layout.block_for_item(item_ix) else {
+                        return (leading.as_ref().expect("leading item").render)(window, cx);
+                    };
                     let is_last = ix + 1 == blocks.len();
                     let (is_first, prev) = flow_position(&blocks, ix);
                     blocks[ix]

@@ -4,6 +4,7 @@ use std::time::Instant;
 use std::{
     ops::{Range, RangeInclusive},
     pin::Pin,
+    rc::Rc,
     sync::{Arc, Mutex, OnceLock},
     task::Poll,
     time::Duration,
@@ -12,9 +13,9 @@ use std::{
 use web_time::Instant;
 
 use gpui::{
-    App, AppContext as _, Bounds, Context, EntityId, FocusHandle, IntoElement, KeyBinding,
-    ListState, ParentElement as _, Pixels, Point, Render, SharedString, Styled as _, Task, Window,
-    prelude::FluentBuilder as _, px,
+    AnyElement, App, AppContext as _, Bounds, Context, EntityId, FocusHandle, IntoElement,
+    KeyBinding, ListState, ParentElement as _, Pixels, Point, Render, SharedString, Styled as _,
+    Task, Window, prelude::FluentBuilder as _, px,
 };
 
 use crate::{
@@ -24,6 +25,7 @@ use crate::{
     text::{
         CodeBlockActionsFn, CodeBlockHighlighterFn, LinkClickHandlerFn, MarkdownExtensions,
         RangeHighlight, RangeHighlightError, RenderedText, TableActionsFn, TextViewStyle,
+        block_list_layout::BlockListLayout,
         document::ParsedDocument,
         format,
         node::{self, NodeContext},
@@ -107,11 +109,20 @@ pub(super) struct LineSpan {
     pub(super) line_height: Pixels,
 }
 
+type LeadingElementFactory = dyn Fn(&mut Window, &mut App) -> AnyElement;
+
+#[derive(Clone)]
+pub(super) struct LeadingElement {
+    pub(super) render: Rc<LeadingElementFactory>,
+    revision: u64,
+}
+
 /// The state of a TextView.
 pub struct TextViewState {
     entity_id: EntityId,
     pub(super) focus_handle: FocusHandle,
     pub(super) list_state: ListState,
+    leading_element: Option<LeadingElement>,
 
     /// The bounds of the text view
     bounds: Bounds<Pixels>,
@@ -182,6 +193,53 @@ impl TextViewState {
         Self::new(TextViewFormat::Html, text, cx)
     }
 
+    /// Installs a leading item for this reader's lifetime. Used only in scrollable mode.
+    ///
+    /// The factory may run repeatedly during measurement and painting. Capture retained
+    /// application state; do not create entities or trigger effects inside the factory.
+    /// The item is not part of Markdown source, block identities, or selection/copy.
+    pub fn with_leading_element<F, E>(mut self, revision: u64, render: F) -> Self
+    where
+        F: Fn(&mut Window, &mut App) -> E + 'static,
+        E: IntoElement,
+    {
+        assert!(
+            self.leading_element.is_none(),
+            "leading item is fixed per reader"
+        );
+        self.leading_element = Some(LeadingElement {
+            render: Rc::new(move |window, cx| render(window, cx).into_any_element()),
+            revision,
+        });
+        self.list_state.reset(
+            self.block_list_layout()
+                .item_count(self.parsed_content.document.blocks.len()),
+        );
+        self
+    }
+
+    /// Remeasures the retained leading item when its content or height changes.
+    /// An unchanged revision is a no-op. Logical Markdown selection and scroll survive.
+    pub fn set_leading_element_revision(&mut self, revision: u64, cx: &mut Context<Self>) {
+        let Some(leading) = &mut self.leading_element else {
+            return;
+        };
+        if leading.revision == revision {
+            return;
+        }
+        leading.revision = revision;
+        self.preserve_inline_selection = true;
+        self.compatible_layout_update = true;
+        if self.list_state.item_count() > 0 {
+            self.list_state.remeasure_items(0..1);
+        }
+        cx.notify();
+    }
+
+    fn block_list_layout(&self) -> BlockListLayout {
+        BlockListLayout::new(self.leading_element.is_some())
+    }
+
     /// Create a new TextViewState.
     fn new(format: TextViewFormat, text: &str, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
@@ -231,6 +289,7 @@ impl TextViewState {
             // as zero height until scrolled into view, which makes the
             // scrollbar jitter as more blocks get measured during scrolling.
             list_state: ListState::new(0, gpui::ListAlignment::Top, px(1000.)).measure_all(),
+            leading_element: None,
             text_view_style: Arc::default(),
             code_block_actions: None,
             code_block_highlighter: None,
@@ -769,12 +828,14 @@ impl TextViewState {
     /// blocks before it keep their spans and their measured heights. Without
     /// this, `render_root` resets the list whenever the block count changes,
     /// which scrolled a streaming view back to the top and measured every
-    /// block again on each new block. Only a grown block count is handled
-    /// here; anything else is left to that reset.
+    /// block again on each new block. A changed tail with the same block count
+    /// also needs remeasurement; a shrinking count is left to that reset.
     fn splice_appended_blocks(&self, new: &ParsedDocument) {
         let old = &self.parsed_content.document.blocks;
         let (old_count, new_count) = (old.len(), new.blocks.len());
-        if old_count == 0 || new_count <= old_count || self.list_state.item_count() != old_count {
+        let layout = self.block_list_layout();
+        let old_items = layout.item_count(old_count);
+        if old_count == 0 || new_count < old_count || self.list_state.item_count() != old_items {
             return;
         }
 
@@ -793,9 +854,12 @@ impl TextViewState {
         // Keeps the replaced blocks' heights as hints and the scroll offset
         // inside them, and has the next layout measure only the blocks that
         // are not measured.
-        self.list_state.remeasure_items(unchanged..old_count);
         self.list_state
-            .splice(old_count..old_count, new_count - old_count);
+            .remeasure_items(layout.item_for_block(unchanged)..old_items);
+        if new_count > old_count {
+            self.list_state
+                .splice(old_items..old_items, new_count - old_count);
+        }
     }
 
     /// Save bounds and unselect if bounds changed.
@@ -817,16 +881,19 @@ impl TextViewState {
 
         let origin = self.bounds.origin.y + self.scroll_offset().y;
         let count = self.list_state.item_count();
+        let layout = self.block_list_layout();
         let mut ix = self.list_state.logical_scroll_top().item_ix;
         while ix < count {
             let bounds = self.list_state.bounds_for_item(ix)?;
             if content_y < bounds.bottom() - origin {
-                return Some(ix);
+                return layout.block_for_item(ix);
             }
             ix += 1;
         }
 
-        count.checked_sub(1)
+        count
+            .checked_sub(1)
+            .and_then(|ix| layout.block_for_item(ix))
     }
 
     #[doc(hidden)]
@@ -1079,9 +1146,11 @@ impl TextViewState {
         let block_ix = pending.block_ix(&self.parsed_content.document);
         let block_off_screen = |ix: usize| {
             let viewport = self.list_state.viewport_bounds();
-            self.list_state.bounds_for_item(ix).is_none_or(|item| {
-                item.bottom() <= viewport.top() || item.top() >= viewport.bottom()
-            })
+            self.list_state
+                .bounds_for_item(self.block_list_layout().item_for_block(ix))
+                .is_none_or(|item| {
+                    item.bottom() <= viewport.top() || item.top() >= viewport.bottom()
+                })
         };
         let reveal_block = block_ix.filter(|ix| {
             self.scrollable
@@ -1155,6 +1224,7 @@ impl Render for TextViewState {
                     } else {
                         None
                     },
+                    self.leading_element.clone(),
                     &node_cx,
                     window,
                     cx,
@@ -1216,7 +1286,8 @@ impl Render for TextViewState {
         // After `render_root`, which resets the list when the block count
         // changed other than by an append, and with it the scroll position.
         if let Some(block_ix) = reveal_block {
-            self.list_state.scroll_to_reveal_item(block_ix);
+            self.list_state
+                .scroll_to_reveal_item(self.block_list_layout().item_for_block(block_ix));
         }
         content
     }

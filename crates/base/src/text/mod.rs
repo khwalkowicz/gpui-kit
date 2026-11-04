@@ -1,3 +1,4 @@
+mod block_list_layout;
 mod document;
 pub mod editor_host;
 mod editor_seam;
