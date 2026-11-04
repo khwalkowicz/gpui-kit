@@ -1641,6 +1641,7 @@ mod tests {
                 div().w(px(240.)).h(px(200.)).child(
                     crate::text::TextView::new(&self.state)
                         .scrollable(true)
+                        .selection_format(SelectionFormat::Source)
                         .selectable(true),
                 )
             }
