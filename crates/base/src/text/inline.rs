@@ -326,6 +326,10 @@ pub(super) struct Inline {
     /// The start of a pending reveal, when it is in this text.
     reveal: Option<RevealAt>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    link_presentation: Option<(
+        super::LinkPresentation,
+        super::link_presentation::SharedLinkInteraction,
+    )>,
     /// What this frame's layout was shaped with, to hand the shaped text to
     /// the next frame (see [`RetainedLayout`]).
     retained_key: Option<(Vec<TextRun>, TextStyle)>,
@@ -612,6 +616,21 @@ impl InlineSelectionProjection {
 }
 
 impl Inline {
+    fn link_occurrence(
+        &self,
+        range: &Range<usize>,
+        link: &LinkMark,
+    ) -> super::link_presentation::LinkOccurrence {
+        let leaf = self
+            .selection_source
+            .as_ref()
+            .map_or(&self.state, |(state, _)| state);
+        super::link_presentation::LinkOccurrence::new(
+            leaf,
+            link.occurrence.clone().unwrap_or_else(|| range.clone()),
+        )
+    }
+
     /// Editor seam (design D3): report this leaf's layout and take the
     /// editor's backgrounds. Inert unless the state carries an editor key
     /// and an editor sink is installed.
@@ -712,6 +731,7 @@ impl Inline {
             range_backgrounds: Vec::new(),
             reveal: None,
             link_click_handler,
+            link_presentation: None,
             retained_key: None,
             handed_over: false,
             editor_piece: None,
@@ -1140,7 +1160,38 @@ impl Element for Inline {
             .text_style
             .clone()
             .unwrap_or_else(|| window.text_style());
-        let runs = text_runs(self.text.len(), &text_style, &self.highlights);
+        self.link_presentation = GlobalState::global(cx).text_view_state().and_then(|view| {
+            let view = view.read(cx);
+            view.link_presentation
+                .clone()
+                .map(|presentation| (presentation, view.link_interaction.clone()))
+        });
+        let highlights = if let Some((presentation, interaction)) = &self.link_presentation {
+            let interaction = interaction.borrow();
+            super::highlight_overlay::overlay_highlights(
+                self.highlights.clone(),
+                self.links.iter().map(|(range, link)| {
+                    let occurrence = self.link_occurrence(range, link);
+                    let hovered = interaction.gesture.hovered.as_ref() == Some(&occurrence);
+                    let pressed =
+                        interaction
+                            .gesture
+                            .pressed
+                            .as_ref()
+                            .is_some_and(|(pressed, down)| {
+                                *pressed == occurrence && down.button == MouseButton::Left
+                            });
+                    (
+                        range.clone(),
+                        presentation.appearance(hovered, pressed, &link.url).into(),
+                    )
+                }),
+                |base, overlay| base.highlight(overlay),
+            )
+        } else {
+            self.highlights.clone()
+        };
+        let runs = text_runs(self.text.len(), &text_style, &highlights);
 
         // Reuse the previous frame's shaped text when it was shaped from the
         // same text, runs and style; `StyledText` consumes its runs on every
@@ -1220,6 +1271,20 @@ impl Element for Inline {
             return;
         }
         let text_layout = self.styled_text.layout().clone();
+        if let Some((_, interaction)) = &self.link_presentation {
+            interaction
+                .borrow_mut()
+                .targets
+                .extend(self.links.iter().map(|(range, link)| {
+                    super::link_presentation::LinkTarget {
+                        occurrence: self.link_occurrence(range, link),
+                        range: range.clone(),
+                        link: link.clone(),
+                        layout: text_layout.clone(),
+                        hitbox: hitbox.clone(),
+                    }
+                }));
+        }
         if !self.range_backgrounds.is_empty() {
             self.paint_range_highlights(&text_layout, window);
         }
@@ -1402,7 +1467,7 @@ impl Element for Inline {
         // Mouse move: repaint only when the pointer enters, leaves or moves
         // between links, so the link cursor follows it. Hovering plain text
         // changes nothing painted.
-        if !self.links.is_empty() {
+        if self.link_presentation.is_none() && !self.links.is_empty() {
             window.on_mouse_event({
                 let hitbox = hitbox.clone();
                 let text_layout = text_layout.clone();
@@ -1423,7 +1488,7 @@ impl Element for Inline {
             });
         }
 
-        if !is_selection {
+        if self.link_presentation.is_none() && !is_selection {
             // click to open link
             window.on_mouse_event({
                 let links = self.links.clone();

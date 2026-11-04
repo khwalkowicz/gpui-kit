@@ -773,10 +773,22 @@ impl BlockNode {
 #[allow(unused)]
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct LinkMark {
+    pub occurrence: Option<Range<usize>>,
     pub url: SharedString,
     /// Optional identifier for footnotes.
     pub identifier: Option<SharedString>,
     pub title: Option<SharedString>,
+}
+
+impl LinkMark {
+    fn resolve_reference(&mut self, references: &HashMap<SharedString, LinkMark>) {
+        if let Some(mark) = self.identifier.as_ref().and_then(|id| references.get(id)) {
+            *self = Self {
+                occurrence: self.occurrence.clone(),
+                ..mark.clone()
+            };
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -2879,11 +2891,7 @@ impl Paragraph {
                 return div().into_any_element();
             }
             for (_, link_mark) in &mut links {
-                if let Some(identifier) = link_mark.identifier.as_ref()
-                    && let Some(mark) = node_cx.link_refs.get(identifier)
-                {
-                    *link_mark = mark.clone();
-                }
+                link_mark.resolve_reference(&node_cx.link_refs);
             }
             let highlights = fade_highlights(highlights, &slice_fades(fades, 0, text.len()));
             let backgrounds = slice_backgrounds(backgrounds, 0, text.len());
@@ -2993,12 +3001,7 @@ impl Paragraph {
                         highlight.style.color = Some(node_cx.style.link());
                         highlight.style.underline = Some(link_underline(&node_cx.style));
 
-                        // convert link references, replace link
-                        if let Some(identifier) = link_mark.identifier.as_ref() {
-                            if let Some(mark) = node_cx.link_refs.get(identifier) {
-                                link_mark = mark.clone();
-                            }
-                        }
+                        link_mark.resolve_reference(&node_cx.link_refs);
 
                         links.push((inner_range.clone(), link_mark));
                     }
@@ -3186,11 +3189,7 @@ impl Paragraph {
                         highlight.style.color = Some(node_cx.style.link());
                         highlight.style.underline = Some(link_underline(&node_cx.style));
 
-                        if let Some(identifier) = link_mark.identifier.as_ref()
-                            && let Some(mark) = node_cx.link_refs.get(identifier)
-                        {
-                            link_mark = mark.clone();
-                        }
+                        link_mark.resolve_reference(&node_cx.link_refs);
 
                         links.push((inner_range.clone(), link_mark));
                     }

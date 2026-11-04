@@ -123,6 +123,9 @@ pub struct TextViewState {
     pub(super) focus_handle: FocusHandle,
     pub(super) list_state: ListState,
     leading_element: Option<LeadingElement>,
+    pub(super) link_presentation: Option<super::LinkPresentation>,
+    pub(super) link_interaction: super::link_presentation::SharedLinkInteraction,
+    link_activation_subscription: Option<gpui::Subscription>,
 
     /// The bounds of the text view
     bounds: Bounds<Pixels>,
@@ -183,6 +186,37 @@ pub struct TextViewState {
 }
 
 impl TextViewState {
+    pub(super) fn observe_link_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.link_presentation.is_some() && self.link_activation_subscription.is_none() {
+            self.link_activation_subscription =
+                Some(cx.observe_window_activation(window, |state, window, cx| {
+                    if !window.is_window_active() {
+                        let mut interaction = state.link_interaction.borrow_mut();
+                        if interaction.gesture.reconcile(None, true) {
+                            cx.notify();
+                        }
+                    }
+                }));
+        }
+    }
+
+    /// Updates read-only link paint without replacing source or invalidating list heights.
+    pub fn set_link_presentation(
+        &mut self,
+        presentation: super::LinkPresentation,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .link_presentation
+            .as_ref()
+            .is_some_and(|old| old.revision == presentation.revision)
+        {
+            return;
+        }
+        self.link_presentation = Some(presentation);
+        cx.notify();
+    }
+
     /// Create a Markdown TextViewState.
     pub fn markdown(text: &str, cx: &mut Context<Self>) -> Self {
         Self::new(TextViewFormat::Markdown, text, cx)
@@ -272,6 +306,9 @@ impl TextViewState {
         let _parse_task = cx.background_spawn(UpdateFuture::new(format, rx, tx_result));
 
         let mut this = Self {
+            link_presentation: None,
+            link_activation_subscription: None,
+            link_interaction: Rc::default(),
             entity_id: cx.entity_id(),
             focus_handle,
             bounds: Bounds::default(),
@@ -579,6 +616,7 @@ impl TextViewState {
     }
 
     fn increment_update(&mut self, text: &str, append: bool, cx: &mut Context<Self>) {
+        *self.link_interaction.borrow_mut() = Default::default();
         self.revision += 1;
         if !append {
             self.full_update_revision = self.revision;
@@ -663,6 +701,7 @@ impl TextViewState {
         if !self.commits(&parsed_update) {
             return;
         }
+        *self.link_interaction.borrow_mut() = Default::default();
 
         match parsed_update.result {
             Ok(content) => {
@@ -1586,6 +1625,72 @@ mod tests {
         node::{BlockNode, Span},
     };
     use gpui::{Entity, TestAppContext};
+
+    #[gpui::test]
+    fn leading_item_stays_outside_source_selection_and_survives_replacement(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::{ParentElement as _, Styled as _, div};
+
+        struct Root {
+            state: Entity<TextViewState>,
+        }
+
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(240.)).h(px(200.)).child(
+                    crate::text::TextView::new(&self.state)
+                        .scrollable(true)
+                        .selectable(true),
+                )
+            }
+        }
+
+        cx.update(crate::init);
+        let (root, cx) = cx.add_window_view(|_, cx| Root {
+            state: cx.new(|cx| {
+                TextViewState::markdown("First paragraph.\n\nLast paragraph.", cx)
+                    .with_leading_element(0, |_, _| div().h(px(72.)).child("Properties"))
+            }),
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        root.update(cx, |root, cx| {
+            root.state.update(cx, |state, cx| {
+                assert_eq!(
+                    state.list_state.item_count(),
+                    state.parsed_content.document.blocks.len() + 1
+                );
+                assert_eq!(state.block_ix_at(px(10.)), None);
+                state.select_all(cx);
+                let before = state.selected_text();
+                assert_eq!(before, "First paragraph.\n\nLast paragraph.");
+                state.set_leading_element_revision(1, cx);
+                assert_eq!(state.selected_text(), before);
+                assert_eq!(state.source().as_ref(), before);
+                state.set_text("Replacement.", cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        root.update(cx, |root, cx| {
+            root.state.update(cx, |state, cx| {
+                assert_eq!(
+                    state.list_state.item_count(),
+                    state.parsed_content.document.blocks.len() + 1
+                );
+                state.select_all(cx);
+                assert_eq!(state.selected_text(), "Replacement.");
+                state.set_text("", cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        root.read_with(cx, |root, cx| {
+            assert_eq!(root.state.read(cx).list_state.item_count(), 1);
+            assert!(root.state.read(cx).source().is_empty());
+        });
+    }
 
     /// A view reading a text view state, inside a view notified on every
     /// frame, counting its renders.

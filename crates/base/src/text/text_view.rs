@@ -741,6 +741,7 @@ impl Element for TextView {
         });
 
         state.update(cx, |state, cx| {
+            state.observe_link_activation(window, cx);
             if text_view_style.is_some()
                 || match (&state.code_block_highlighter, &code_block_highlighter) {
                     (Some(previous), Some(next)) => !Arc::ptr_eq(previous, next),
@@ -824,7 +825,9 @@ impl Element for TextView {
             })
             .refine_style(&self.style)
             .into_any_element();
+        GlobalState::global(cx).push_text_view_state(state.clone());
         let layout_id = el.request_layout(window, cx);
+        GlobalState::global(cx).pop_text_view_state();
         (layout_id, TextViewLayoutState { state, element: el })
     }
 
@@ -910,6 +913,14 @@ impl Element for TextView {
         cx: &mut App,
     ) {
         let state = &request_layout.state;
+        let link_interaction = state
+            .read(cx)
+            .link_presentation
+            .as_ref()
+            .map(|_| state.read(cx).link_interaction.clone());
+        if let Some(interaction) = &link_interaction {
+            interaction.borrow_mut().targets.clear();
+        }
         if self.selectable {
             state.read(cx).selection_adapter.begin_frame();
         }
@@ -928,6 +939,99 @@ impl Element for TextView {
             request_layout.element.paint(window, cx);
         }
         GlobalState::global(cx).pop_text_view_state();
+
+        if let Some(interaction) = link_interaction {
+            if interaction
+                .borrow_mut()
+                .reconcile(window.mouse_position(), window, false)
+            {
+                cx.notify(state.entity_id());
+            }
+            window.on_mouse_event({
+                let interaction = Rc::downgrade(&interaction);
+                let state = state.downgrade();
+                move |event: &gpui::MouseMoveEvent, phase, window, cx| {
+                    if !phase.bubble() {
+                        return;
+                    }
+                    if let Some(interaction) = interaction.upgrade() {
+                        let mut interaction = interaction.borrow_mut();
+                        let cancelled = interaction
+                            .gesture
+                            .pressed
+                            .as_ref()
+                            .is_some_and(|(_, down)| event.pressed_button != Some(down.button));
+                        if interaction.reconcile(event.position, window, cancelled) {
+                            _ = state.update(cx, |_, cx| cx.notify());
+                        }
+                    }
+                }
+            });
+            window.on_mouse_event({
+                let interaction = Rc::downgrade(&interaction);
+                let state = state.downgrade();
+                move |event: &gpui::MouseDownEvent, phase, window, cx| {
+                    if !phase.bubble() {
+                        return;
+                    }
+                    if let Some(interaction) = interaction.upgrade()
+                        && interaction.borrow_mut().down(event, window)
+                    {
+                        _ = state.update(cx, |_, cx| cx.notify());
+                    }
+                }
+            });
+            window.on_mouse_event({
+                let interaction = Rc::downgrade(&interaction);
+                let state = state.downgrade();
+                let handler = self.link_click_handler.clone();
+                move |event: &gpui::MouseUpEvent, phase, window, cx| {
+                    if !phase.bubble() {
+                        return;
+                    }
+                    let Some(interaction) = interaction.upgrade() else {
+                        return;
+                    };
+                    let (activation, changed) = {
+                        let mut interaction = interaction.borrow_mut();
+                        let was_pressed = interaction.gesture.pressed.is_some();
+                        let changed =
+                            interaction.reconcile(event.position, window, false) || was_pressed;
+                        let target = interaction
+                            .target(event.position, window)
+                            .map(|target| (target.occurrence.clone(), target.link.url.clone()));
+                        let down = interaction
+                            .gesture
+                            .release(target.as_ref().map(|(occurrence, _)| occurrence));
+                        let activation = down
+                            .filter(|down| down.button == event.button)
+                            .zip(target)
+                            .map(|(down, (_, url))| (url, down));
+                        (activation, changed)
+                    };
+                    let selected = state
+                        .read_with(cx, |state, cx| state.has_selection(cx))
+                        .unwrap_or(true);
+                    if changed {
+                        _ = state.update(cx, |_, cx| cx.notify());
+                    }
+                    if let Some((url, down)) = activation.filter(|_| !selected) {
+                        TextSelection::end(window, cx);
+                        cx.stop_propagation();
+                        handle_link_click(
+                            &handler,
+                            url,
+                            ClickEvent::Mouse(gpui::MouseClickEvent {
+                                down,
+                                up: event.clone(),
+                            }),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            });
+        }
 
         // Every list has scrolled by now, so the line of a reveal is where
         // it ends up this frame.
@@ -3300,6 +3404,106 @@ mod tests {
             single_line,
             "the table text refinement is measured"
         );
+    }
+
+    mod reader_links {
+        use std::sync::{Arc, Mutex};
+
+        use super::*;
+        use crate::text::LinkPresentation;
+
+        struct Root {
+            state: Entity<TextViewState>,
+            clicks: Arc<Mutex<Vec<ClickEvent>>>,
+        }
+
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let clicks = self.clicks.clone();
+                div()
+                    .w(px(240.))
+                    .child(
+                        TextView::new(&self.state).on_link_click(move |_, event, _, _| {
+                            clicks.lock().unwrap().push(event.clone())
+                        }),
+                    )
+            }
+        }
+
+        fn check_gestures(source: &'static str, cx: &mut TestAppContext) {
+            cx.update(crate::init);
+            let clicks = Arc::new(Mutex::new(Vec::new()));
+            let captured = clicks.clone();
+            let (_, cx) = cx.add_window_view(move |_, cx| Root {
+                state: cx.new(|cx| {
+                    let mut state = TextViewState::markdown(source, cx);
+                    state.set_link_presentation(
+                        LinkPresentation {
+                            normal: Default::default(),
+                            hover: Default::default(),
+                            pressed: Default::default(),
+                            visited: Default::default(),
+                            revision: 0,
+                            is_visited: Arc::new(|_| false),
+                        },
+                        cx,
+                    );
+                    state
+                }),
+                clicks,
+            });
+            let cx: &mut VisualTestContext = cx;
+            cx.update(|window, _| window.activate_window());
+            cx.run_until_parked();
+            let start = point(px(10.), px(10.));
+            let end = point(px(11.), px(10.));
+            cx.simulate_mouse_up(start, MouseButton::Left, Modifiers::default());
+            assert!(captured.lock().unwrap().is_empty());
+
+            let mut modifiers = Modifiers::default();
+            modifiers.control = true;
+            cx.simulate_mouse_down(start, MouseButton::Left, modifiers);
+            cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+            {
+                let clicks = captured.lock().unwrap();
+                assert_eq!(clicks.len(), 1);
+                let ClickEvent::Mouse(click) = &clicks[0] else {
+                    panic!("mouse click");
+                };
+                assert_eq!(click.down.position, start);
+                assert!(click.down.modifiers.control);
+                assert_eq!(click.up.position, end);
+            }
+
+            cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+            cx.simulate_mouse_move(
+                point(px(230.), px(100.)),
+                Some(MouseButton::Left),
+                Modifiers::default(),
+            );
+            cx.simulate_mouse_move(start, Some(MouseButton::Left), Modifiers::default());
+            cx.simulate_mouse_up(start, MouseButton::Left, Modifiers::default());
+            assert_eq!(captured.lock().unwrap().len(), 1);
+
+            cx.simulate_mouse_down(start, MouseButton::Middle, Modifiers::default());
+            cx.simulate_mouse_up(start, MouseButton::Middle, Modifiers::default());
+            assert_eq!(captured.lock().unwrap().len(), 2);
+            cx.simulate_mouse_down(start, MouseButton::Right, Modifiers::default());
+            cx.simulate_mouse_up(start, MouseButton::Right, Modifiers::default());
+            assert_eq!(captured.lock().unwrap().len(), 2);
+        }
+
+        #[gpui::test]
+        fn plain_link_requires_real_down_and_cancels_without_rearming(cx: &mut TestAppContext) {
+            check_gestures("[example](https://example.com)", cx);
+        }
+
+        #[gpui::test]
+        fn inline_flow_link_requires_real_down_and_cancels_without_rearming(
+            cx: &mut TestAppContext,
+        ) {
+            check_gestures("[`code` **bold**](https://example.com)", cx);
+        }
     }
 
     #[gpui::test]

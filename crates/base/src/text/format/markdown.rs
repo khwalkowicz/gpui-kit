@@ -830,6 +830,10 @@ fn parse_paragraph(
         }
         Node::Link(val) => {
             let link_mark = Some(LinkMark {
+                occurrence: val
+                    .position
+                    .as_ref()
+                    .map(|pos| pos.start.offset..pos.end.offset),
                 url: val.url.clone().into(),
                 title: val.title.clone().map(|s| s.into()),
                 ..Default::default()
@@ -933,6 +937,10 @@ fn parse_paragraph(
         }
         Node::LinkReference(link) => {
             let link_mark = LinkMark {
+                occurrence: link
+                    .position
+                    .as_ref()
+                    .map(|pos| pos.start.offset..pos.end.offset),
                 url: "".into(),
                 title: link.label.clone().map(Into::into),
                 identifier: Some(link.identifier.clone().into()),
@@ -966,6 +974,7 @@ fn collect_definitions(node: &Node, definitions: &mut BTreeMap<String, LinkMark>
         definitions
             .entry(def.identifier.clone())
             .or_insert_with(|| LinkMark {
+                occurrence: None,
                 url: def.url.clone().into(),
                 identifier: Some(def.identifier.clone().into()),
                 title: def.title.clone().map(Into::into),
