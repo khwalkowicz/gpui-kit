@@ -168,6 +168,7 @@ pub struct TextView {
     code_block_highlighter: Option<Arc<CodeBlockHighlighterFn>>,
     table_actions: Option<Arc<TableActionsFn>>,
     link_click_handler: Option<Arc<LinkClickHandlerFn>>,
+    link_hover_handler: Option<Arc<super::link_hover::LinkHoverHandler>>,
     image_source: Option<Arc<ImageSourceFn>>,
     reveal_handler: Option<Rc<RevealHandlerFn>>,
     markdown_extensions: Arc<MarkdownExtensions>,
@@ -198,6 +199,18 @@ impl Styled for TextView {
 }
 
 impl TextView {
+    /// Observes the actual resolved destination under the pointer, or `None` on leave.
+    /// Notifications are deferred and coalesce superseded changes. Source replacement,
+    /// disappearing targets, window deactivation and state disposal clear the destination.
+    /// This opt-in observer does not change styling, selection or link activation.
+    pub fn on_link_hover(
+        mut self,
+        handler: impl Fn(Option<&SharedString>, &mut App) + Send + Sync + 'static,
+    ) -> Self {
+        self.link_hover_handler = Some(Arc::new(handler));
+        self
+    }
+
     /// Create new TextView with managed state.
     pub fn new(state: &Entity<TextViewState>) -> Self {
         Self {
@@ -218,6 +231,7 @@ impl TextView {
             code_block_highlighter: None,
             table_actions: None,
             link_click_handler: None,
+            link_hover_handler: None,
             image_source: None,
             reveal_handler: None,
             markdown_extensions: Arc::default(),
@@ -245,6 +259,7 @@ impl TextView {
             code_block_highlighter: None,
             table_actions: None,
             link_click_handler: None,
+            link_hover_handler: None,
             image_source: None,
             reveal_handler: None,
             markdown_extensions: Arc::default(),
@@ -272,6 +287,7 @@ impl TextView {
             code_block_highlighter: None,
             table_actions: None,
             link_click_handler: None,
+            link_hover_handler: None,
             image_source: None,
             reveal_handler: None,
             markdown_extensions: Arc::default(),
@@ -741,6 +757,9 @@ impl Element for TextView {
         });
 
         state.update(cx, |state, cx| {
+            state
+                .link_hover
+                .set_handler(self.link_hover_handler.clone());
             state.observe_link_activation(window, cx);
             if text_view_style.is_some()
                 || match (&state.code_block_highlighter, &code_block_highlighter) {
@@ -913,11 +932,10 @@ impl Element for TextView {
         cx: &mut App,
     ) {
         let state = &request_layout.state;
-        let link_interaction = state
-            .read(cx)
-            .link_presentation
-            .as_ref()
-            .map(|_| state.read(cx).link_interaction.clone());
+        let custom_gestures = state.read(cx).link_presentation.is_some();
+        let hover = state.read(cx).link_hover.clone();
+        let link_interaction = (custom_gestures || hover.is_observed())
+            .then(|| state.read(cx).link_interaction.clone());
         if let Some(interaction) = &link_interaction {
             interaction.borrow_mut().targets.clear();
         }
@@ -947,9 +965,17 @@ impl Element for TextView {
             {
                 cx.notify(state.entity_id());
             }
+            hover.update(
+                interaction
+                    .borrow()
+                    .target(window.mouse_position(), window)
+                    .map(|target| target.link.url.clone()),
+                cx,
+            );
             window.on_mouse_event({
                 let interaction = Rc::downgrade(&interaction);
                 let state = state.downgrade();
+                let hover = hover.clone();
                 move |event: &gpui::MouseMoveEvent, phase, window, cx| {
                     if !phase.bubble() {
                         return;
@@ -964,75 +990,81 @@ impl Element for TextView {
                         if interaction.reconcile(event.position, window, cancelled) {
                             _ = state.update(cx, |_, cx| cx.notify());
                         }
-                    }
-                }
-            });
-            window.on_mouse_event({
-                let interaction = Rc::downgrade(&interaction);
-                let state = state.downgrade();
-                move |event: &gpui::MouseDownEvent, phase, window, cx| {
-                    if !phase.bubble() {
-                        return;
-                    }
-                    if let Some(interaction) = interaction.upgrade()
-                        && interaction.borrow_mut().down(event, window)
-                    {
-                        _ = state.update(cx, |_, cx| cx.notify());
-                    }
-                }
-            });
-            window.on_mouse_event({
-                let interaction = Rc::downgrade(&interaction);
-                let state = state.downgrade();
-                let handler = self.link_click_handler.clone();
-                move |event: &gpui::MouseUpEvent, phase, window, cx| {
-                    if !phase.bubble() {
-                        return;
-                    }
-                    let Some(interaction) = interaction.upgrade() else {
-                        return;
-                    };
-                    let (activation, changed) = {
-                        let mut interaction = interaction.borrow_mut();
-                        let was_pressed = interaction.gesture.pressed.is_some();
-                        let changed =
-                            interaction.reconcile(event.position, window, false) || was_pressed;
-                        let target = interaction
+                        let destination = interaction
                             .target(event.position, window)
-                            .map(|target| (target.occurrence.clone(), target.link.url.clone()));
-                        let down = interaction
-                            .gesture
-                            .release(target.as_ref().map(|(occurrence, _)| occurrence));
-                        let activation = down
-                            .filter(|down| down.button == event.button)
-                            .zip(target)
-                            .map(|(down, (_, url))| (url, down));
-                        (activation, changed)
-                    };
-                    let selected = state
-                        .read_with(cx, |state, cx| state.has_selection(cx))
-                        .unwrap_or(true);
-                    if changed {
-                        _ = state.update(cx, |_, cx| cx.notify());
-                    }
-                    if let Some((url, down)) = activation.filter(|_| !selected) {
-                        TextSelection::end(window, cx);
-                        cx.stop_propagation();
-                        handle_link_click(
-                            &handler,
-                            url,
-                            ClickEvent::Mouse(gpui::MouseClickEvent {
-                                down,
-                                up: event.clone(),
-                            }),
-                            window,
-                            cx,
-                        );
+                            .map(|target| target.link.url.clone());
+                        drop(interaction);
+                        hover.update(destination, cx);
                     }
                 }
             });
+            if custom_gestures {
+                window.on_mouse_event({
+                    let interaction = Rc::downgrade(&interaction);
+                    let state = state.downgrade();
+                    move |event: &gpui::MouseDownEvent, phase, window, cx| {
+                        if !phase.bubble() {
+                            return;
+                        }
+                        if let Some(interaction) = interaction.upgrade()
+                            && interaction.borrow_mut().down(event, window)
+                        {
+                            _ = state.update(cx, |_, cx| cx.notify());
+                        }
+                    }
+                });
+                window.on_mouse_event({
+                    let interaction = Rc::downgrade(&interaction);
+                    let state = state.downgrade();
+                    let handler = self.link_click_handler.clone();
+                    move |event: &gpui::MouseUpEvent, phase, window, cx| {
+                        if !phase.bubble() {
+                            return;
+                        }
+                        let Some(interaction) = interaction.upgrade() else {
+                            return;
+                        };
+                        let (activation, changed) = {
+                            let mut interaction = interaction.borrow_mut();
+                            let was_pressed = interaction.gesture.pressed.is_some();
+                            let changed =
+                                interaction.reconcile(event.position, window, false) || was_pressed;
+                            let target = interaction
+                                .target(event.position, window)
+                                .map(|target| (target.occurrence.clone(), target.link.url.clone()));
+                            let down = interaction
+                                .gesture
+                                .release(target.as_ref().map(|(occurrence, _)| occurrence));
+                            let activation = down
+                                .filter(|down| down.button == event.button)
+                                .zip(target)
+                                .map(|(down, (_, url))| (url, down));
+                            (activation, changed)
+                        };
+                        let selected = state
+                            .read_with(cx, |state, cx| state.has_selection(cx))
+                            .unwrap_or(true);
+                        if changed {
+                            _ = state.update(cx, |_, cx| cx.notify());
+                        }
+                        if let Some((url, down)) = activation.filter(|_| !selected) {
+                            TextSelection::end(window, cx);
+                            cx.stop_propagation();
+                            handle_link_click(
+                                &handler,
+                                url,
+                                ClickEvent::Mouse(gpui::MouseClickEvent {
+                                    down,
+                                    up: event.clone(),
+                                }),
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                });
+            }
         }
-
         // Every list has scrolled by now, so the line of a reveal is where
         // it ends up this frame.
         if state.read(cx).pending_reveal.is_some() {
@@ -3415,18 +3447,22 @@ mod tests {
         struct Root {
             state: Entity<TextViewState>,
             clicks: Arc<Mutex<Vec<ClickEvent>>>,
+            hovered: Arc<Mutex<Vec<Option<String>>>>,
         }
 
         impl Render for Root {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
                 let clicks = self.clicks.clone();
-                div()
-                    .w(px(240.))
-                    .child(
-                        TextView::new(&self.state).on_link_click(move |_, event, _, _| {
+                let hovered = self.hovered.clone();
+                div().w(px(240.)).child(
+                    TextView::new(&self.state)
+                        .on_link_hover(move |url, _| {
+                            hovered.lock().unwrap().push(url.map(|url| url.to_string()));
+                        })
+                        .on_link_click(move |_, event, _, _| {
                             clicks.lock().unwrap().push(event.clone())
                         }),
-                    )
+                )
             }
         }
 
@@ -3451,6 +3487,7 @@ mod tests {
                     state
                 }),
                 clicks,
+                hovered: Arc::default(),
             });
             let cx: &mut VisualTestContext = cx;
             cx.update(|window, _| window.activate_window());
@@ -3499,10 +3536,191 @@ mod tests {
         }
 
         #[gpui::test]
+        fn hover_reports_resolved_targets_and_clears_after_source_replacement(
+            cx: &mut TestAppContext,
+        ) {
+            cx.update(crate::init);
+            let hovered = Arc::new(Mutex::new(Vec::new()));
+            let captured = hovered.clone();
+            let (root, cx) = cx.add_window_view(move |_, cx| Root {
+                state: cx.new(|cx| {
+                    TextViewState::markdown(
+                        "[hover][target]\n\n[target]: https://example.com/hover",
+                        cx,
+                    )
+                }),
+                clicks: Arc::default(),
+                hovered,
+            });
+            let cx: &mut VisualTestContext = cx;
+            cx.update(|window, _| window.activate_window());
+            cx.run_until_parked();
+            let start = point(px(10.), px(10.));
+            cx.simulate_mouse_move(start, None, Modifiers::default());
+            cx.run_until_parked();
+            assert_eq!(
+                *captured.lock().unwrap(),
+                [Some("https://example.com/hover".into())]
+            );
+            cx.simulate_mouse_move(point(px(11.), px(10.)), None, Modifiers::default());
+            cx.run_until_parked();
+            assert_eq!(captured.lock().unwrap().len(), 1);
+            cx.update(|window, cx| {
+                window.simulate_mouse_move(point(px(260.), px(180.)), cx);
+                window.simulate_mouse_move(start, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                captured.lock().unwrap().len(),
+                1,
+                "a superseded leave/rehover does not redeliver the same destination"
+            );
+            root.update(cx, |root, cx| {
+                root.state.update(cx, |state, cx| {
+                    state.set_text("[fresh document](https://example.com/hover)", cx)
+                })
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                captured
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|url| url.as_deref() == Some("https://example.com/hover"))
+                    .count(),
+                2,
+                "a replacement source reports its same-URL target afresh"
+            );
+            root.update(cx, |root, cx| {
+                root.state.update(cx, |state, cx| {
+                    state.set_text("replacement without a link", cx)
+                })
+            });
+            cx.run_until_parked();
+            assert_eq!(captured.lock().unwrap().last(), Some(&None));
+            assert!(root.read_with(cx, |root, _| root.clicks.lock().unwrap().is_empty()));
+        }
+
+        #[gpui::test]
         fn inline_flow_link_requires_real_down_and_cancels_without_rearming(
             cx: &mut TestAppContext,
         ) {
             check_gestures("[`code` **bold**](https://example.com)", cx);
+        }
+
+        #[gpui::test]
+        fn hover_tracks_wrapped_formatting_leave_blur_and_reader_disposal(cx: &mut TestAppContext) {
+            cx.update(crate::init);
+            let hovered = Arc::new(Mutex::new(Vec::new()));
+            let captured = hovered.clone();
+            let source = "[**bold café 日本語** and `code` with a long naturally wrapping label repeated across several lines](https://example.com/wrapped)";
+            let (root, cx) = cx.add_window_view(move |_, cx| Root {
+                state: cx.new(|cx| TextViewState::markdown(source, cx)),
+                clicks: Arc::default(),
+                hovered,
+            });
+            let cx: &mut VisualTestContext = cx;
+            cx.update(|window, _| window.activate_window());
+            cx.run_until_parked();
+            cx.simulate_mouse_move(point(px(10.), px(10.)), None, Modifiers::default());
+            cx.run_until_parked();
+            assert_eq!(
+                captured.lock().unwrap().last(),
+                Some(&Some("https://example.com/wrapped".into()))
+            );
+            cx.simulate_mouse_move(point(px(10.), px(30.)), None, Modifiers::default());
+            cx.run_until_parked();
+            assert_eq!(
+                captured.lock().unwrap().len(),
+                1,
+                "wrapped fragments share the actual destination"
+            );
+            cx.simulate_mouse_move(point(px(260.), px(180.)), None, Modifiers::default());
+            cx.run_until_parked();
+            assert_eq!(captured.lock().unwrap().last(), Some(&None));
+            cx.simulate_mouse_move(point(px(10.), px(10.)), None, Modifiers::default());
+            cx.run_until_parked();
+            cx.deactivate_window();
+            cx.run_until_parked();
+            assert_eq!(captured.lock().unwrap().last(), Some(&None));
+            cx.update(|window, _| window.activate_window());
+            cx.simulate_mouse_move(point(px(11.), px(10.)), None, Modifiers::default());
+            cx.run_until_parked();
+            assert_eq!(
+                captured.lock().unwrap().last(),
+                Some(&Some("https://example.com/wrapped".into()))
+            );
+            root.update(cx, |root, cx| {
+                assert_eq!(root.state.read(cx).rendered_text().source(), source);
+                root.state = cx.new(|cx| TextViewState::markdown("No links remain", cx));
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert_eq!(captured.lock().unwrap().last(), Some(&None));
+            assert!(root.read_with(cx, |root, _| root.clicks.lock().unwrap().is_empty()));
+        }
+
+        #[gpui::test]
+        fn stationary_hover_reconciles_scroll_and_resized_clipping(cx: &mut TestAppContext) {
+            struct ScrollRoot {
+                state: Entity<TextViewState>,
+                hovered: Arc<Mutex<Vec<Option<String>>>>,
+                width: Pixels,
+            }
+            impl Render for ScrollRoot {
+                fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                    let hovered = self.hovered.clone();
+                    div().w(self.width).h(px(100.)).child(
+                        TextView::new(&self.state)
+                            .scrollable(true)
+                            .size_full()
+                            .on_link_hover(move |url, _| {
+                                hovered.lock().unwrap().push(url.map(|url| url.to_string()));
+                            }),
+                    )
+                }
+            }
+            cx.update(crate::init);
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let hovered = captured.clone();
+            let (root, cx) = cx.add_window_view(move |_, cx| ScrollRoot {
+                state: cx.new(|cx| TextViewState::markdown(&format!("[A long label occupying the first line and wrapping below](https://example.com/scroll)\n\n{}", "Plain paragraph.\n\n".repeat(30)), cx)),
+                hovered,
+                width: px(240.),
+            });
+            let cx: &mut VisualTestContext = cx;
+            cx.update(|window, _| window.activate_window());
+            cx.run_until_parked();
+            cx.simulate_mouse_move(point(px(150.), px(10.)), None, Modifiers::default());
+            cx.run_until_parked();
+            assert_eq!(
+                captured.lock().unwrap().last(),
+                Some(&Some("https://example.com/scroll".into()))
+            );
+            root.update(cx, |root, cx| {
+                root.state.read(cx).list_state().scroll_to_end();
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert_eq!(captured.lock().unwrap().last(), Some(&None));
+            root.update(cx, |root, cx| {
+                root.state
+                    .read(cx)
+                    .list_state()
+                    .scroll_to(Default::default());
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                captured.lock().unwrap().last(),
+                Some(&Some("https://example.com/scroll".into()))
+            );
+            root.update(cx, |root, cx| {
+                root.width = px(80.);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert_eq!(captured.lock().unwrap().last(), Some(&None));
         }
     }
 

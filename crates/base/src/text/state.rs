@@ -125,6 +125,7 @@ pub struct TextViewState {
     leading_element: Option<LeadingElement>,
     pub(super) link_presentation: Option<super::LinkPresentation>,
     pub(super) link_interaction: super::link_presentation::SharedLinkInteraction,
+    pub(super) link_hover: super::link_hover::LinkHover,
     link_activation_subscription: Option<gpui::Subscription>,
 
     /// The bounds of the text view
@@ -187,10 +188,13 @@ pub struct TextViewState {
 
 impl TextViewState {
     pub(super) fn observe_link_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.link_presentation.is_some() && self.link_activation_subscription.is_none() {
+        if (self.link_presentation.is_some() || self.link_hover.is_observed())
+            && self.link_activation_subscription.is_none()
+        {
             self.link_activation_subscription =
                 Some(cx.observe_window_activation(window, |state, window, cx| {
                     if !window.is_window_active() {
+                        state.link_hover.update(None, cx);
                         let mut interaction = state.link_interaction.borrow_mut();
                         if interaction.gesture.reconcile(None, true) {
                             cx.notify();
@@ -276,6 +280,8 @@ impl TextViewState {
 
     /// Create a new TextViewState.
     fn new(format: TextViewFormat, text: &str, cx: &mut Context<Self>) -> Self {
+        cx.on_release(|state, cx| state.link_hover.update(None, cx))
+            .detach();
         let focus_handle = cx.focus_handle();
         let selection_adapter = TextViewSelectionAdapter::new(cx.entity().downgrade(), cx);
 
@@ -309,6 +315,7 @@ impl TextViewState {
             link_presentation: None,
             link_activation_subscription: None,
             link_interaction: Rc::default(),
+            link_hover: Default::default(),
             entity_id: cx.entity_id(),
             focus_handle,
             bounds: Bounds::default(),
@@ -616,6 +623,7 @@ impl TextViewState {
     }
 
     fn increment_update(&mut self, text: &str, append: bool, cx: &mut Context<Self>) {
+        self.link_hover.reset(cx);
         *self.link_interaction.borrow_mut() = Default::default();
         self.revision += 1;
         if !append {
@@ -701,6 +709,7 @@ impl TextViewState {
         if !self.commits(&parsed_update) {
             return;
         }
+        self.link_hover.reset(cx);
         *self.link_interaction.borrow_mut() = Default::default();
 
         match parsed_update.result {

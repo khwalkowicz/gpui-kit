@@ -330,6 +330,7 @@ pub(super) struct Inline {
         super::LinkPresentation,
         super::link_presentation::SharedLinkInteraction,
     )>,
+    link_interaction: Option<super::link_presentation::SharedLinkInteraction>,
     /// What this frame's layout was shaped with, to hand the shaped text to
     /// the next frame (see [`RetainedLayout`]).
     retained_key: Option<(Vec<TextRun>, TextStyle)>,
@@ -732,6 +733,7 @@ impl Inline {
             reveal: None,
             link_click_handler,
             link_presentation: None,
+            link_interaction: None,
             retained_key: None,
             handed_over: false,
             editor_piece: None,
@@ -1166,6 +1168,11 @@ impl Element for Inline {
                 .clone()
                 .map(|presentation| (presentation, view.link_interaction.clone()))
         });
+        self.link_interaction = GlobalState::global(cx).text_view_state().and_then(|view| {
+            let view = view.read(cx);
+            (view.link_presentation.is_some() || view.link_hover.is_observed())
+                .then(|| view.link_interaction.clone())
+        });
         let highlights = if let Some((presentation, interaction)) = &self.link_presentation {
             let interaction = interaction.borrow();
             super::highlight_overlay::overlay_highlights(
@@ -1271,7 +1278,7 @@ impl Element for Inline {
             return;
         }
         let text_layout = self.styled_text.layout().clone();
-        if let Some((_, interaction)) = &self.link_presentation {
+        if let Some(interaction) = &self.link_interaction {
             interaction
                 .borrow_mut()
                 .targets
